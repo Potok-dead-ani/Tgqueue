@@ -1,0 +1,137 @@
+import asyncio, os, sqlite3
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL = os.getenv("CHANNEL")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+DB = "posts.db"
+
+def init_db():
+    con = sqlite3.connect(DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS posts(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id TEXT, media_type TEXT, caption TEXT,
+        publish_at TEXT, published INTEGER DEFAULT 0)""")
+    con.commit(); con.close()
+
+def add_post(fid, mt, cap, when_utc):
+    con = sqlite3.connect(DB)
+    con.execute("INSERT INTO posts(file_id,media_type,caption,publish_at) VALUES(?,?,?,?)",
+                (fid, mt, cap, when_utc.isoformat()))
+    con.commit(); con.close()
+
+def due_posts():
+    con = sqlite3.connect(DB)
+    rows = con.execute("SELECT id,file_id,media_type,caption FROM posts WHERE published=0 AND publish_at<=?",
+                       (datetime.utcnow().isoformat(),)).fetchall()
+    con.close(); return rows
+
+def mark_done(pid):
+    con = sqlite3.connect(DB)
+    con.execute("UPDATE posts SET published=1 WHERE id=?", (pid,))
+    con.commit(); con.close()
+
+def pending():
+    con = sqlite3.connect(DB)
+    rows = con.execute("SELECT id,caption,publish_at FROM posts WHERE published=0 ORDER BY publish_at").fetchall()
+    con.close(); return rows
+
+def cancel(pid):
+    con = sqlite3.connect(DB)
+    cur = con.execute("DELETE FROM posts WHERE id=? AND published=0", (pid,))
+    con.commit(); ok = cur.rowcount>0; con.close(); return ok
+
+class Form(StatesGroup):
+    caption = State()
+
+def admin(m): return m.from_user and m.from_user.id == ADMIN_ID
+
+@dp.message(CommandStart())
+async def start(m: Message):
+    if not admin(m): return
+    await m.answer(
+        "👋 Скинь видео/фото, потом подпись:\n"
+        "<code>текст | https://ссылка | 2026-02-01 18:00</code>\n\n"
+        "Команды: /list — очередь, /cancel ID — удалить",
+        parse_mode="HTML")
+
+@dp.message(F.video | F.photo | F.document)
+async def on_media(m: Message, state: FSMContext):
+    if not admin(m): return
+    if m.video: fid, mt = m.video.file_id, "video"
+    elif m.photo: fid, mt = m.photo[-1].file_id, "photo"
+    else: fid, mt = m.document.file_id, "document"
+    await state.update_data(fid=fid, mt=mt)
+    await state.set_state(Form.caption)
+    await m.reply("Файл принят. Теперь подпись:\n<code>текст | ссылка | 2026-02-01 18:00</code>",
+                  parse_mode="HTML")
+
+@dp.message(Form.caption)
+async def on_caption(m: Message, state: FSMContext):
+    if not admin(m): return
+    d = await state.get_data()
+    parts = [p.strip() for p in (m.text or "").split("|")]
+    if len(parts) == 2:
+        body, link, when_str = parts[0], None, parts[1]
+    elif len(parts) >= 3:
+        body, link, when_str = parts[0], parts[1], parts[2]
+    else:
+        await m.reply("Формат: <code>текст | ссылка | 2026-02-01 18:00</code>", parse_mode="HTML"); return
+    try:
+        wl = datetime.strptime(when_str, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except ValueError:
+        await m.reply("Дата не та. Пример: <code>2026-02-01 18:00</code>", parse_mode="HTML"); return
+    cap = body + (f"\n\n🔗 {link}" if link else "")
+    add_post(d["fid"], d["mt"], cap, wl.astimezone(ZoneInfo("UTC")).replace(tzinfo=None))
+    await state.clear()
+    await m.reply(f"✅ Запланировано на {wl.strftime('%d.%m %H:%M')} ({TZ.key})")
+
+@dp.message(Command("list"))
+async def cmd_list(m: Message):
+    if not admin(m): return
+    rows = pending()
+    if not rows: await m.answer("Очередь пуста."); return
+    lines = ["<b>Запланировано:</b>"]
+    for pid, cap, pa in rows:
+        dt = datetime.fromisoformat(pa).replace(tzinfo=ZoneInfo("UTC")).astimezone(TZ)
+        lines.append(f"<b>#{pid}</b> {dt.strftime('%d.%m %H:%M')} — {cap[:40]}…")
+    await m.answer("\n".join(lines), parse_mode="HTML")
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(m: Message):
+    if not admin(m): return
+    p = m.text.split()
+    if len(p)!=2 or not p[1].isdigit():
+        await m.reply("Формат: <code>/cancel 5</code>", parse_mode="HTML"); return
+    ok = cancel(int(p[1]))
+    await m.reply("🗑 Удалено." if ok else "Не найден.")
+
+async def worker():
+    while True:
+        for pid, fid, mt, cap in due_posts():
+            try:
+                if mt=="video": await bot.send_video(CHANNEL, fid, caption=cap)
+                elif mt=="photo": await bot.send_photo(CHANNEL, fid, caption=cap)
+                else: await bot.send_document(CHANNEL, fid, caption=cap)
+                mark_done(pid)
+            except Exception as e:
+                print("err", pid, e)
+        await asyncio.sleep(30)
+
+async def main():
+    init_db()
+    asyncio.create_task(worker())
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
